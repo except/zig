@@ -346,7 +346,7 @@ const NlistWithIndex = struct {
         }
     }
 
-    fn filterInSection(symbols: []NlistWithIndex, sect: macho.section_64) []NlistWithIndex {
+    fn filterByAddress(symbols: []NlistWithIndex, start_addr: u64, end_addr: u64) []NlistWithIndex {
         const Predicate = struct {
             addr: u64,
 
@@ -355,8 +355,12 @@ const NlistWithIndex = struct {
             }
         };
 
-        const start = MachO.findFirst(NlistWithIndex, symbols, 0, Predicate{ .addr = sect.addr });
-        const end = MachO.findFirst(NlistWithIndex, symbols, start, Predicate{ .addr = sect.addr + sect.size });
+        const start = MachO.findFirst(NlistWithIndex, symbols, 0, Predicate{
+            .addr = start_addr,
+        });
+        const end = MachO.findFirst(NlistWithIndex, symbols, start, Predicate{
+            .addr = end_addr,
+        });
 
         return symbols[start..end];
     }
@@ -455,7 +459,11 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
         );
 
         // Symbols within this section only.
-        const filtered_nlists = NlistWithIndex.filterInSection(sorted_nlists, sect);
+        const filtered_nlists = NlistWithIndex.filterByAddress(
+            sorted_nlists,
+            sect.addr,
+            sect.addr + sect.size,
+        );
 
         macho_file.has_dices = macho_file.has_dices or blk: {
             if (self.text_section_index) |index| {
@@ -467,55 +475,94 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
         };
         macho_file.has_stabs = macho_file.has_stabs or self.debug_info != null;
 
-        if (dead_strip) blk: {
-            if (filtered_nlists.len == 0) break :blk; // nothing to split
-
+        if (dead_strip and filtered_nlists.len > 0) {
             // If the first nlist does not match the start of the section,
             // then we need to encapsulate the memory range [section start, first symbol)
             // as a temporary symbol and insert the matching Atom.
             const first_nlist = filtered_nlists[0].nlist;
-            if (first_nlist.n_value > sect.addr) {}
-        }
+            if (first_nlist.n_value > sect.addr) {
+                const local_sym_index = self.sections_as_symbols.get(sect_id) orelse blk: {
+                    const local_sym_index = @intCast(u32, macho_file.locals.items.len);
+                    try macho_file.locals.append(allocator, .{
+                        .n_strx = 0,
+                        .n_type = macho.N_SECT,
+                        .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1),
+                        .n_desc = 0,
+                        .n_value = sect.addr,
+                    });
+                    try self.sections_as_symbols.putNoClobber(allocator, sect_id, local_sym_index);
+                    break :blk local_sym_index;
+                };
+                const atom_size = first_nlist.n_value - sect.addr;
+                const atom_code: ?[]const u8 = if (code) |cc|
+                    cc[0..atom_size]
+                else
+                    null;
+                const atom = try self.parseIntoAtom(
+                    allocator,
+                    local_sym_index,
+                    atom_size,
+                    sect.@"align",
+                    atom_code,
+                    relocs,
+                    &.{},
+                    match,
+                    macho_file,
+                );
+                if (!self.start_atoms.contains(match)) {
+                    try self.start_atoms.putNoClobber(allocator, match, atom);
+                }
 
-        // If there is no symbol to refer to this atom, we create
-        // a temp one, unless we already did that when working out the relocations
-        // of other atoms.
-        const local_sym_index = self.sections_as_symbols.get(sect_id) orelse blk: {
-            const local_sym_index = @intCast(u32, macho_file.locals.items.len);
-            try macho_file.locals.append(allocator, .{
-                .n_strx = 0,
-                .n_type = macho.N_SECT,
-                .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1),
-                .n_desc = 0,
-                .n_value = sect.addr,
-            });
-            try self.sections_as_symbols.putNoClobber(allocator, sect_id, local_sym_index);
-            break :blk local_sym_index;
-        };
-        const atom = try self.parseIntoAtom(
-            allocator,
-            local_sym_index,
-            sect.size,
-            sect.@"align",
-            code,
-            relocs,
-            filtered_nlists,
-            match,
-            macho_file,
-        );
-
-        if (!self.start_atoms.contains(match)) {
-            try self.start_atoms.putNoClobber(allocator, match, atom);
-        }
-
-        if (self.end_atoms.getPtr(match)) |last| {
-            last.*.next = atom;
-            atom.prev = last.*;
-            last.* = atom;
+                if (self.end_atoms.getPtr(match)) |last| {
+                    last.*.next = atom;
+                    atom.prev = last.*;
+                    last.* = atom;
+                } else {
+                    try self.end_atoms.putNoClobber(allocator, match, atom);
+                }
+                try self.contained_atoms.append(allocator, atom);
+            }
         } else {
-            try self.end_atoms.putNoClobber(allocator, match, atom);
+            // If there is no symbol to refer to this atom, we create
+            // a temp one, unless we already did that when working out the relocations
+            // of other atoms.
+            const local_sym_index = self.sections_as_symbols.get(sect_id) orelse blk: {
+                const local_sym_index = @intCast(u32, macho_file.locals.items.len);
+                try macho_file.locals.append(allocator, .{
+                    .n_strx = 0,
+                    .n_type = macho.N_SECT,
+                    .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1),
+                    .n_desc = 0,
+                    .n_value = sect.addr,
+                });
+                try self.sections_as_symbols.putNoClobber(allocator, sect_id, local_sym_index);
+                break :blk local_sym_index;
+            };
+            const atom = try self.parseIntoAtom(
+                allocator,
+                local_sym_index,
+                sect.size,
+                sect.@"align",
+                code,
+                relocs,
+                filtered_nlists,
+                match,
+                macho_file,
+            );
+
+            if (!self.start_atoms.contains(match)) {
+                try self.start_atoms.putNoClobber(allocator, match, atom);
+            }
+
+            if (self.end_atoms.getPtr(match)) |last| {
+                last.*.next = atom;
+                atom.prev = last.*;
+                last.* = atom;
+            } else {
+                try self.end_atoms.putNoClobber(allocator, match, atom);
+            }
+            try self.contained_atoms.append(allocator, atom);
         }
-        try self.contained_atoms.append(allocator, atom);
     }
 }
 
