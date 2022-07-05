@@ -443,7 +443,6 @@ pub fn flush(self: *MachO, comp: *Compilation, prog_node: *std.Progress.Node) !v
         }
         return;
     }
-    self.base.options.gc_sections = true;
 
     if (self.base.options.output_mode == .Lib and self.base.options.link_mode == .Static) {
         if (build_options.have_llvm) {
