@@ -176,6 +176,13 @@ pub fn free(self: *Object, allocator: Allocator, macho_file: *MachO) void {
                     .n_desc = 0,
                     .n_value = 0,
                 };
+                _ = macho_file.atom_by_index_table.remove(atom.local_sym_index);
+                _ = macho_file.gc_roots.remove(atom);
+
+                for (atom.contained.items) |sym_off| {
+                    _ = macho_file.atom_by_index_table.remove(sym_off.local_sym_index);
+                }
+
                 atom.local_sym_index = 0;
             }
             if (atom == last_atom) {
@@ -445,16 +452,13 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
     // We only care about defined symbols, so filter every other out.
     const sorted_nlists = sorted_all_nlists.items[0..iundefsym];
 
-    const dead_strip = blk: {
-        const dead_strip = macho_file.base.options.gc_sections orelse break :blk false;
-        if (dead_strip or macho_file.base.options.optimize_mode != .Debug)
-            break :blk self.header.flags & macho.MH_SUBSECTIONS_VIA_SYMBOLS != 0;
-        break :blk false;
-    };
+    const dead_strip = macho_file.base.options.gc_sections orelse false;
+    const subsections_via_symbols = self.header.flags & macho.MH_SUBSECTIONS_VIA_SYMBOLS != 0 and
+        (macho_file.base.options.optimize_mode != .Debug or dead_strip);
 
     for (seg.sections.items) |sect, id| {
         const sect_id = @intCast(u8, id);
-        log.debug("putting section '{s},{s}' as an Atom", .{ sect.segName(), sect.sectName() });
+        log.debug("parsing section '{s},{s}' into Atoms", .{ sect.segName(), sect.sectName() });
 
         // Get matching segment/section in the final artifact.
         const match = (try macho_file.getMatchingSection(sect)) orelse {
@@ -494,7 +498,7 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
         };
         macho_file.has_stabs = macho_file.has_stabs or self.debug_info != null;
 
-        if (dead_strip and filtered_nlists.len > 0) {
+        if (subsections_via_symbols and filtered_nlists.len > 0) {
             // If the first nlist does not match the start of the section,
             // then we need to encapsulate the memory range [section start, first symbol)
             // as a temporary symbol and insert the matching Atom.
@@ -526,7 +530,7 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
                     relocs,
                     &.{},
                     match,
-                    sect.addr,
+                    sect,
                     macho_file,
                 );
             }
@@ -575,7 +579,7 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
                     relocs,
                     atom_nlists,
                     match,
-                    sect.addr,
+                    sect,
                     macho_file,
                 );
             }
@@ -604,7 +608,7 @@ pub fn parseIntoAtoms(self: *Object, allocator: Allocator, macho_file: *MachO) !
                 relocs,
                 filtered_nlists,
                 match,
-                sect.addr,
+                sect,
                 macho_file,
             );
         }
@@ -621,7 +625,7 @@ fn parseIntoAtom(
     relocs: []const macho.relocation_info,
     nlists: []const NlistWithIndex,
     match: MatchingSection,
-    base_addr: u64,
+    sect: macho.section_64,
     macho_file: *MachO,
 ) !void {
     const sym = macho_file.locals.items[local_sym_index];
@@ -633,10 +637,10 @@ fn parseIntoAtom(
         mem.copy(u8, atom.code.items, cc);
     }
 
-    const base_offset = sym.n_value - base_addr;
+    const base_offset = sym.n_value - sect.addr;
     const filtered_relocs = filterRelocs(relocs, base_offset, base_offset + size);
     try atom.parseRelocs(filtered_relocs, .{
-        .base_addr = base_addr,
+        .base_addr = sect.addr,
         .base_offset = @intCast(i32, base_offset),
         .allocator = allocator,
         .object = self,
@@ -690,7 +694,24 @@ fn parseIntoAtom(
             .offset = nlist.n_value - sym.n_value,
             .stab = stab,
         });
+
+        try macho_file.atom_by_index_table.putNoClobber(allocator, sym_index, atom);
     }
+
+    const is_gc_root = blk: {
+        if (sect.isDontDeadStrip()) break :blk true;
+        if (sect.isDontDeadStripIfReferencesLive()) {
+            // TODO if isDontDeadStripIfReferencesLive we should analyse the edges
+            // before making it a GC root
+            break :blk true;
+        }
+        if (mem.eql(u8, "__StaticInit", sect.sectName())) break :blk true;
+        break :blk false;
+    };
+    if (is_gc_root) {
+        try macho_file.gc_roots.putNoClobber(allocator, atom, {});
+    }
+    try macho_file.atom_by_index_table.putNoClobber(allocator, local_sym_index, atom);
 
     if (!self.start_atoms.contains(match)) {
         try self.start_atoms.putNoClobber(allocator, match, atom);
