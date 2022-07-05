@@ -441,6 +441,7 @@ pub fn flush(self: *MachO, comp: *Compilation, prog_node: *std.Progress.Node) !v
         }
         return;
     }
+    self.base.options.gc_sections = true;
 
     if (self.base.options.output_mode == .Lib and self.base.options.link_mode == .Static) {
         if (build_options.have_llvm) {
@@ -2181,6 +2182,7 @@ pub fn createEmptyAtom(self: *MachO, local_sym_index: u32, size: u64, alignment:
     try atom.code.resize(self.base.allocator, size_usize);
     mem.set(u8, atom.code.items, 0);
 
+    try self.atom_by_index_table.putNoClobber(self.base.allocator, local_sym_index, atom);
     try self.managed_atoms.append(self.base.allocator, atom);
     return atom;
 }
@@ -3921,7 +3923,6 @@ pub fn lowerUnnamedConst(self: *MachO, typed_value: TypedValue, decl_index: Modu
     const required_alignment = typed_value.ty.abiAlignment(self.base.options.target);
     const local_sym_index = try self.allocateLocalSymbol();
     const atom = try self.createEmptyAtom(local_sym_index, @sizeOf(u64), math.log2(required_alignment));
-    try self.atom_by_index_table.putNoClobber(self.base.allocator, local_sym_index, atom);
 
     const res = try codegen.generateSymbol(&self.base, decl.srcLoc(), typed_value, &code_buffer, .none, .{
         .parent_atom_index = local_sym_index,
@@ -5602,7 +5603,7 @@ fn pruneAndSortSectionsInSegment(self: *MachO, maybe_seg_id: *?u16, indices: []*
         const old_idx = maybe_index.* orelse continue;
         const sect = sections[old_idx];
         if (sect.size == 0) {
-            log.debug("pruning section {s},{s}", .{ sect.segName(), sect.sectName() });
+            log.warn("pruning section {s},{s}", .{ sect.segName(), sect.sectName() });
             maybe_index.* = null;
             seg.inner.cmdsize -= @sizeOf(macho.section_64);
             seg.inner.nsects -= 1;
@@ -5635,7 +5636,7 @@ fn pruneAndSortSectionsInSegment(self: *MachO, maybe_seg_id: *?u16, indices: []*
 
     if (seg.inner.nsects == 0 and !mem.eql(u8, "__TEXT", seg.inner.segName())) {
         // Segment has now become empty, so mark it as such
-        log.debug("marking segment {s} as dead", .{seg.inner.segName()});
+        log.warn("marking segment {s} as dead", .{seg.inner.segName()});
         seg.inner.cmd = @intToEnum(macho.LC, 0);
         maybe_seg_id.* = null;
     }
@@ -5733,11 +5734,126 @@ fn gcAtoms(self: *MachO) !void {
         _ = try self.gc_roots.getOrPut(self.base.allocator, gc_root);
     }
 
-    log.warn("GC roots:", .{});
+    // // Add any atom targeting an import as GC root
+    // var atoms_it = self.atoms.iterator();
+    // while (atoms_it.next()) |entry| {
+    //     var atom = entry.value_ptr.*;
 
+    //     while (true) {
+    //         for (atom.relocs.items) |rel| {
+    //             if ((try Atom.getTargetAtom(rel, self)) == null) switch (rel.target) {
+    //                 .local => {},
+    //                 .global => |n_strx| {
+    //                     const resolv = self.symbol_resolver.get(n_strx).?;
+    //                     switch (resolv.where) {
+    //                         .global => {},
+    //                         .undef => {
+    //                             _ = try self.gc_roots.getOrPut(self.base.allocator, atom);
+    //                             break;
+    //                         },
+    //                     }
+    //                 },
+    //             };
+    //         }
+
+    //         if (atom.prev) |prev| {
+    //             atom = prev;
+    //         } else break;
+    //     }
+    // }
+
+    var stack = std.ArrayList(*Atom).init(self.base.allocator);
+    defer stack.deinit();
+    try stack.ensureUnusedCapacity(self.gc_roots.count());
+
+    var retained = std.AutoHashMap(*Atom, void).init(self.base.allocator);
+    defer retained.deinit();
+    try retained.ensureUnusedCapacity(self.gc_roots.count());
+
+    log.warn("GC roots:", .{});
     var gc_roots_it = self.gc_roots.keyIterator();
     while (gc_roots_it.next()) |gc_root| {
         self.logAtom(gc_root.*);
+
+        stack.appendAssumeCapacity(gc_root.*);
+        retained.putAssumeCapacityNoClobber(gc_root.*, {});
+    }
+
+    log.warn("walking tree...", .{});
+    while (stack.popOrNull()) |source_atom| {
+        for (source_atom.relocs.items) |rel| {
+            if (try Atom.getTargetAtom(rel, self)) |target_atom| {
+                const gop = try retained.getOrPut(target_atom);
+                if (!gop.found_existing) {
+                    log.warn("  RETAINED ATOM(%{d}) -> ATOM(%{d})", .{
+                        source_atom.local_sym_index,
+                        target_atom.local_sym_index,
+                    });
+                    try stack.append(target_atom);
+                }
+            }
+        }
+    }
+
+    var atoms_it = self.atoms.iterator();
+    while (atoms_it.next()) |entry| {
+        const match = entry.key_ptr.*;
+
+        if (self.text_segment_cmd_index) |seg| {
+            if (seg == match.seg) {
+                if (self.eh_frame_section_index) |sect| {
+                    if (sect == match.sect) continue;
+                }
+            }
+        }
+
+        if (self.data_segment_cmd_index) |seg| {
+            if (seg == match.seg) {
+                if (self.rustc_section_index) |sect| {
+                    if (sect == match.sect) continue;
+                }
+            }
+        }
+
+        const seg = &self.load_commands.items[match.seg].segment;
+        const sect = &seg.sections.items[match.sect];
+        var atom = entry.value_ptr.*;
+
+        log.warn("GCing atoms in {s},{s}", .{ sect.segName(), sect.sectName() });
+
+        while (true) {
+            const orig_prev = atom.prev;
+
+            if (!retained.contains(atom)) {
+                // Dead atom; remove.
+                log.warn("  DEAD ATOM(%{d})", .{atom.local_sym_index});
+
+                const sym = &self.locals.items[atom.local_sym_index];
+                sym.n_strx = 0;
+
+                for (atom.contained.items) |sym_off| {
+                    const inner = &self.locals.items[sym_off.local_sym_index];
+                    inner.n_strx = 0;
+                }
+
+                sect.size -= atom.size;
+                log.warn("size = {x}", .{sect.size});
+                if (atom.next) |next| {
+                    next.prev = atom.prev;
+                }
+                if (atom.prev) |prev| {
+                    prev.next = atom.next;
+                } else {
+                    // TODO I think a null would be better here.
+                    // The section will be GCed in the next step.
+                    entry.value_ptr.* = if (atom.next) |next| next else undefined;
+                }
+            }
+
+            if (orig_prev) |prev| {
+                atom = prev;
+            } else break;
+        }
     }
 }
 
@@ -7020,7 +7136,7 @@ fn logAtoms(self: MachO) void {
 
 fn logAtom(self: MachO, atom: *const Atom) void {
     const sym = self.locals.items[atom.local_sym_index];
-    log.warn("%{d} @ {x}", .{ atom.local_sym_index, sym.n_value });
+    log.warn("ATOM(%{d}) @ {x}", .{ atom.local_sym_index, sym.n_value });
 
     for (atom.contained.items) |sym_off| {
         const inner_sym = self.locals.items[sym_off.local_sym_index];

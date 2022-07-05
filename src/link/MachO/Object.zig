@@ -706,12 +706,16 @@ fn parseIntoAtom(
             break :blk true;
         }
         if (mem.eql(u8, "__StaticInit", sect.sectName())) break :blk true;
-        break :blk false;
+        switch (sect.type_()) {
+            macho.S_MOD_INIT_FUNC_POINTERS,
+            macho.S_MOD_TERM_FUNC_POINTERS,
+            => break :blk true,
+            else => break :blk false,
+        }
     };
     if (is_gc_root) {
         try macho_file.gc_roots.putNoClobber(allocator, atom, {});
     }
-    try macho_file.atom_by_index_table.putNoClobber(allocator, local_sym_index, atom);
 
     if (!self.start_atoms.contains(match)) {
         try self.start_atoms.putNoClobber(allocator, match, atom);
