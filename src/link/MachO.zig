@@ -1173,9 +1173,10 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
         try self.allocateSpecialSymbols();
         try self.allocateGlobals();
 
-        if (build_options.enable_logging) {
+        if (build_options.enable_logging or true) {
             self.logSymtab();
             self.logSectionOrdinals();
+            self.logAtoms();
         }
 
         if (use_llvm or use_stage1) {
@@ -3395,7 +3396,7 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
         const metadata = entry.value_ptr.*;
         const seg = &self.load_commands.items[match.seg].segment;
         const sect = &seg.sections.items[match.sect];
-        log.debug("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
+        log.warn("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
             sect.segName(),
             sect.sectName(),
             metadata.size,
@@ -3452,7 +3453,7 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
                 sym.n_value = base_vaddr;
                 sym.n_sect = n_sect;
 
-                log.debug("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
+                log.warn("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
                     self.getString(sym.n_strx),
                     base_vaddr,
                     base_vaddr + atom.size,
@@ -6898,55 +6899,55 @@ fn snapshotState(self: *MachO) !void {
 }
 
 fn logSymtab(self: MachO) void {
-    log.debug("locals:", .{});
+    log.warn("locals:", .{});
     for (self.locals.items) |sym, id| {
-        log.debug("  {d}: {s}: @{x} in {d}", .{ id, self.getString(sym.n_strx), sym.n_value, sym.n_sect });
+        log.warn("  {d}: {s}: @{x} in {d}", .{ id, self.getString(sym.n_strx), sym.n_value, sym.n_sect });
     }
 
-    log.debug("globals:", .{});
+    log.warn("globals:", .{});
     for (self.globals.items) |sym, id| {
-        log.debug("  {d}: {s}: @{x} in {d}", .{ id, self.getString(sym.n_strx), sym.n_value, sym.n_sect });
+        log.warn("  {d}: {s}: @{x} in {d}", .{ id, self.getString(sym.n_strx), sym.n_value, sym.n_sect });
     }
 
-    log.debug("undefs:", .{});
+    log.warn("undefs:", .{});
     for (self.undefs.items) |sym, id| {
-        log.debug("  {d}: {s}: in {d}", .{ id, self.getString(sym.n_strx), sym.n_desc });
+        log.warn("  {d}: {s}: in {d}", .{ id, self.getString(sym.n_strx), sym.n_desc });
     }
 
     {
-        log.debug("resolver:", .{});
+        log.warn("resolver:", .{});
         var it = self.symbol_resolver.iterator();
         while (it.next()) |entry| {
-            log.debug("  {s} => {}", .{ self.getString(entry.key_ptr.*), entry.value_ptr.* });
+            log.warn("  {s} => {}", .{ self.getString(entry.key_ptr.*), entry.value_ptr.* });
         }
     }
 
-    log.debug("GOT entries:", .{});
+    log.warn("GOT entries:", .{});
     for (self.got_entries_table.values()) |value| {
         const key = self.got_entries.items[value].target;
         const atom = self.got_entries.items[value].atom;
         const n_value = self.locals.items[atom.local_sym_index].n_value;
         switch (key) {
-            .local => |ndx| log.debug("  {d}: @{x}", .{ ndx, n_value }),
-            .global => |n_strx| log.debug("  {s}: @{x}", .{ self.getString(n_strx), n_value }),
+            .local => |ndx| log.warn("  {d}: @{x}", .{ ndx, n_value }),
+            .global => |n_strx| log.warn("  {s}: @{x}", .{ self.getString(n_strx), n_value }),
         }
     }
 
-    log.debug("__thread_ptrs entries:", .{});
+    log.warn("__thread_ptrs entries:", .{});
     for (self.tlv_ptr_entries_table.values()) |value| {
         const key = self.tlv_ptr_entries.items[value].target;
         const atom = self.tlv_ptr_entries.items[value].atom;
         const n_value = self.locals.items[atom.local_sym_index].n_value;
         assert(key == .global);
-        log.debug("  {s}: @{x}", .{ self.getString(key.global), n_value });
+        log.warn("  {s}: @{x}", .{ self.getString(key.global), n_value });
     }
 
-    log.debug("stubs:", .{});
+    log.warn("stubs:", .{});
     for (self.stubs_table.keys()) |key| {
         const value = self.stubs_table.get(key).?;
         const atom = self.stubs.items[value];
         const sym = self.locals.items[atom.local_sym_index];
-        log.debug("  {s}: @{x}", .{ self.getString(key), sym.n_value });
+        log.warn("  {s}: @{x}", .{ self.getString(key), sym.n_value });
     }
 }
 
@@ -6961,6 +6962,41 @@ fn logSectionOrdinals(self: MachO) void {
             sect.segName(),
             sect.sectName(),
         });
+    }
+}
+
+fn logAtoms(self: MachO) void {
+    log.warn("atoms:", .{});
+    var it = self.atoms.iterator();
+    while (it.next()) |entry| {
+        const match = entry.key_ptr.*;
+        var atom = entry.value_ptr.*;
+
+        while (atom.prev) |prev| {
+            atom = prev;
+        }
+
+        const seg = self.load_commands.items[match.seg].segment;
+        const sect = seg.sections.items[match.sect];
+        log.warn("{s},{s}", .{ sect.segName(), sect.sectName() });
+
+        while (true) {
+            const sym = self.locals.items[atom.local_sym_index];
+            log.warn("%{d} @ {x}", .{ atom.local_sym_index, sym.n_value });
+
+            for (atom.contained.items) |sym_off| {
+                const inner_sym = self.locals.items[sym_off.local_sym_index];
+                log.warn("  %{d} ('{s}') @ {x}", .{
+                    sym_off.local_sym_index,
+                    self.getString(inner_sym.n_strx),
+                    inner_sym.n_value,
+                });
+            }
+
+            if (atom.next) |next| {
+                atom = next;
+            } else break;
+        }
     }
 }
 

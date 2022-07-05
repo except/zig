@@ -236,6 +236,7 @@ pub fn freeListEligible(self: Atom, macho_file: MachO) bool {
 
 const RelocContext = struct {
     base_addr: u64 = 0,
+    base_offset: i32 = 0,
     allocator: Allocator,
     object: *Object,
     macho_file: *MachO,
@@ -366,7 +367,7 @@ pub fn parseRelocs(self: *Atom, relocs: []const macho.relocation_info, context: 
             ) orelse unreachable;
             break :target Relocation.Target{ .global = n_strx };
         };
-        const offset = @intCast(u32, rel.r_address);
+        const offset = @intCast(u32, rel.r_address - context.base_offset);
 
         switch (arch) {
             .aarch64 => {
@@ -487,7 +488,7 @@ fn addPtrBindingOrRebase(
         .global => |n_strx| {
             try self.bindings.append(context.allocator, .{
                 .n_strx = n_strx,
-                .offset = @intCast(u32, rel.r_address),
+                .offset = @intCast(u32, rel.r_address - context.base_offset),
             });
         },
         .local => {
@@ -529,7 +530,10 @@ fn addPtrBindingOrRebase(
             };
 
             if (should_rebase) {
-                try self.rebases.append(context.allocator, @intCast(u32, rel.r_address));
+                try self.rebases.append(
+                    context.allocator,
+                    @intCast(u32, rel.r_address - context.base_offset),
+                );
             }
         },
     }
