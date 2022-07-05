@@ -3396,7 +3396,7 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
         const metadata = entry.value_ptr.*;
         const seg = &self.load_commands.items[match.seg].segment;
         const sect = &seg.sections.items[match.sect];
-        log.warn("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
+        log.debug("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
             sect.segName(),
             sect.sectName(),
             metadata.size,
@@ -3453,7 +3453,7 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
                 sym.n_value = base_vaddr;
                 sym.n_sect = n_sect;
 
-                log.warn("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
+                log.debug("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
                     self.getString(sym.n_strx),
                     base_vaddr,
                     base_vaddr + atom.size,
