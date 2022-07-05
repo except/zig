@@ -57,6 +57,8 @@ const SystemLib = struct {
     weak: bool = false,
 };
 
+const N_DESC_GCED: u16 = @bitCast(u16, @as(i16, -1));
+
 base: File,
 
 /// If this is not null, an object file is created by LLVM and linked with LLD afterwards.
@@ -1168,6 +1170,7 @@ pub fn flushModule(self: *MachO, comp: *Compilation, prog_node: *std.Progress.No
 
         const use_llvm = build_options.have_llvm and self.base.options.use_llvm;
         if (use_llvm or use_stage1) {
+            self.logAtoms();
             try self.gcAtoms();
             try self.pruneAndSortSections();
             try self.allocateSegments();
@@ -3304,12 +3307,7 @@ fn resolveDyldStubBinder(self: *MachO) !void {
         const vaddr = try self.allocateAtom(atom, @sizeOf(u64), 8, match);
         log.debug("allocated {s} atom at 0x{x}", .{ self.getString(sym.n_strx), vaddr });
         atom_sym.n_value = vaddr;
-    } else {
-        const seg = &self.load_commands.items[self.data_const_segment_cmd_index.?].segment;
-        const sect = &seg.sections.items[self.got_section_index.?];
-        sect.size += atom.size;
-        try self.addAtomToSection(atom, match);
-    }
+    } else try self.addAtomToSection(atom, match);
 
     atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
 }
@@ -5734,33 +5732,48 @@ fn gcAtoms(self: *MachO) !void {
         _ = try self.gc_roots.getOrPut(self.base.allocator, gc_root);
     }
 
-    // // Add any atom targeting an import as GC root
-    // var atoms_it = self.atoms.iterator();
-    // while (atoms_it.next()) |entry| {
-    //     var atom = entry.value_ptr.*;
+    // if (self.tlv_ptrs_section_index) |sect| {
+    //     var atom = self.atoms.get(.{
+    //         .seg = self.data_segment_cmd_index.?,
+    //         .sect = sect,
+    //     }).?;
 
     //     while (true) {
-    //         for (atom.relocs.items) |rel| {
-    //             if ((try Atom.getTargetAtom(rel, self)) == null) switch (rel.target) {
-    //                 .local => {},
-    //                 .global => |n_strx| {
-    //                     const resolv = self.symbol_resolver.get(n_strx).?;
-    //                     switch (resolv.where) {
-    //                         .global => {},
-    //                         .undef => {
-    //                             _ = try self.gc_roots.getOrPut(self.base.allocator, atom);
-    //                             break;
-    //                         },
-    //                     }
-    //                 },
-    //             };
-    //         }
+    //         _ = try self.gc_roots.getOrPut(self.base.allocator, atom);
 
     //         if (atom.prev) |prev| {
     //             atom = prev;
     //         } else break;
     //     }
     // }
+
+    // Add any atom targeting an import as GC root
+    var atoms_it = self.atoms.iterator();
+    while (atoms_it.next()) |entry| {
+        var atom = entry.value_ptr.*;
+
+        while (true) {
+            for (atom.relocs.items) |rel| {
+                if ((try Atom.getTargetAtom(rel, self)) == null) switch (rel.target) {
+                    .local => {},
+                    .global => |n_strx| {
+                        const resolv = self.symbol_resolver.get(n_strx).?;
+                        switch (resolv.where) {
+                            .global => {},
+                            .undef => {
+                                _ = try self.gc_roots.getOrPut(self.base.allocator, atom);
+                                break;
+                            },
+                        }
+                    },
+                };
+            }
+
+            if (atom.prev) |prev| {
+                atom = prev;
+            } else break;
+        }
+    }
 
     var stack = std.ArrayList(*Atom).init(self.base.allocator);
     defer stack.deinit();
@@ -5795,7 +5808,7 @@ fn gcAtoms(self: *MachO) !void {
         }
     }
 
-    var atoms_it = self.atoms.iterator();
+    atoms_it = self.atoms.iterator();
     while (atoms_it.next()) |entry| {
         const match = entry.key_ptr.*;
 
@@ -5829,24 +5842,53 @@ fn gcAtoms(self: *MachO) !void {
                 log.warn("  DEAD ATOM(%{d})", .{atom.local_sym_index});
 
                 const sym = &self.locals.items[atom.local_sym_index];
-                sym.n_strx = 0;
+                sym.n_desc = N_DESC_GCED;
+
+                if (self.symbol_resolver.getPtr(sym.n_strx)) |resolv| {
+                    if (resolv.local_sym_index == atom.local_sym_index) {
+                        const global = &self.globals.items[resolv.where_index];
+                        global.n_desc = N_DESC_GCED;
+                    }
+                }
+
+                for (self.got_entries.items) |got_entry| {
+                    if (got_entry.atom == atom) {
+                        _ = self.got_entries_table.swapRemove(got_entry.target);
+                        break;
+                    }
+                }
+
+                for (self.stubs.items) |stub, i| {
+                    if (stub == atom) {
+                        _ = self.stubs_table.swapRemove(@intCast(u32, i));
+                        break;
+                    }
+                }
 
                 for (atom.contained.items) |sym_off| {
                     const inner = &self.locals.items[sym_off.local_sym_index];
-                    inner.n_strx = 0;
+                    inner.n_desc = N_DESC_GCED;
+
+                    if (self.symbol_resolver.getPtr(inner.n_strx)) |resolv| {
+                        if (resolv.local_sym_index == atom.local_sym_index) {
+                            const global = &self.globals.items[resolv.where_index];
+                            global.n_desc = N_DESC_GCED;
+                        }
+                    }
                 }
 
+                log.warn("  BEFORE size = {x}", .{sect.size});
                 sect.size -= atom.size;
-                log.warn("size = {x}", .{sect.size});
-                if (atom.next) |next| {
-                    next.prev = atom.prev;
-                }
+                log.warn("  AFTER size = {x}", .{sect.size});
                 if (atom.prev) |prev| {
                     prev.next = atom.next;
+                }
+                if (atom.next) |next| {
+                    next.prev = atom.prev;
                 } else {
                     // TODO I think a null would be better here.
                     // The section will be GCed in the next step.
-                    entry.value_ptr.* = if (atom.next) |next| next else undefined;
+                    entry.value_ptr.* = if (atom.prev) |prev| prev else undefined;
                 }
             }
 
@@ -5921,8 +5963,11 @@ fn writeDyldInfoData(self: *MachO) !void {
             }
 
             const seg = self.load_commands.items[match.seg].segment;
+            const sect = seg.sections.items[match.sect];
+            log.warn("dyld info for {s},{s}", .{ sect.segName(), sect.sectName() });
 
             while (true) {
+                log.warn("  ATOM %{d}", .{atom.local_sym_index});
                 const sym = self.locals.items[atom.local_sym_index];
                 const base_offset = sym.n_value - seg.inner.vmaddr;
 
@@ -6362,8 +6407,17 @@ fn writeSymbolTable(self: *MachO) !void {
 
     for (self.locals.items) |sym| {
         if (sym.n_strx == 0) continue;
+        if (sym.n_desc == N_DESC_GCED) continue;
         if (self.symbol_resolver.get(sym.n_strx)) |_| continue;
         try locals.append(sym);
+    }
+
+    var globals = std.ArrayList(macho.nlist_64).init(self.base.allocator);
+    defer globals.deinit();
+
+    for (self.globals.items) |sym| {
+        if (sym.n_desc == N_DESC_GCED) continue;
+        try globals.append(sym);
     }
 
     // TODO How do we handle null global symbols in incremental context?
@@ -6436,7 +6490,7 @@ fn writeSymbolTable(self: *MachO) !void {
     }
 
     const nlocals = locals.items.len;
-    const nexports = self.globals.items.len;
+    const nexports = globals.items.len;
     const nundefs = undefs.items.len;
 
     const locals_off = symtab.symoff;
@@ -6447,7 +6501,7 @@ fn writeSymbolTable(self: *MachO) !void {
     const exports_off = locals_off + locals_size;
     const exports_size = nexports * @sizeOf(macho.nlist_64);
     log.debug("writing exported symbols from 0x{x} to 0x{x}", .{ exports_off, exports_size + exports_off });
-    try self.base.file.?.pwriteAll(mem.sliceAsBytes(self.globals.items), exports_off);
+    try self.base.file.?.pwriteAll(mem.sliceAsBytes(globals.items), exports_off);
 
     const undefs_off = exports_off + exports_size;
     const undefs_size = nundefs * @sizeOf(macho.nlist_64);
@@ -7136,11 +7190,11 @@ fn logAtoms(self: MachO) void {
 
 fn logAtom(self: MachO, atom: *const Atom) void {
     const sym = self.locals.items[atom.local_sym_index];
-    log.warn("ATOM(%{d}) @ {x}", .{ atom.local_sym_index, sym.n_value });
+    log.warn("  ATOM(%{d}) @ {x}", .{ atom.local_sym_index, sym.n_value });
 
     for (atom.contained.items) |sym_off| {
         const inner_sym = self.locals.items[sym_off.local_sym_index];
-        log.warn("  %{d} ('{s}') @ {x}", .{
+        log.warn("    %{d} ('{s}') @ {x}", .{
             sym_off.local_sym_index,
             self.getString(inner_sym.n_strx),
             inner_sym.n_value,
